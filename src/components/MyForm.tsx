@@ -1,0 +1,202 @@
+import React, { useState , useEffect } from 'react';
+import axios from 'axios';
+import { KEYUTIL, X509 } from 'jsrsasign'; // Ensure you have jsrsasign installed
+
+import { Certificate } from "pkijs";
+import { fromBER } from "asn1js";
+
+
+import {
+  Aes256Gcm,
+  CipherSuite,
+  DhkemP384HkdfSha384,
+  HkdfSha384,
+} from "@hpke/core";
+
+
+
+interface FormData {
+  name: string;
+  email: string;
+  message: string;
+}
+
+const MyForm: React.FC = () => {
+  const [formData, setFormData] = useState<FormData>({
+    name: '',
+    email: '',
+    message: '',
+  });
+
+    const [publicKeyBase64, setPublicKeyBase64] = useState('');
+    const [publicKeyCert, setPublicKeyCert] = useState('');
+    const [jwkPublicKey, setJwkPublicKey] = useState('');
+
+
+  
+  useEffect(() => {
+      const fetchPublicKey = async () => {
+          try {
+              const response = await axios.get('http://localhost:8080/hpke/public-key', {
+                  responseType: 'json', // Ensure the response is treated as JSON
+              });
+              if (!response.data || !response.data.publicKey) {
+                  throw new Error('Public key not found in response');
+              }
+              console.log('Public Key Base64:', response.data.publicKey);
+              setPublicKeyBase64(response.data.publicKey);
+              if(!response.data.publicKeyCert) {
+                console.warn('Public key certificate not found in response');
+              }
+              console.log('Public Key Certificate:', response.data.publicKeyCert);
+              setPublicKeyCert(response.data.publicKeyCert || null);
+              if(!response.data.jwkPublicKey) {
+                console.warn('JWK public key not found in response');
+              }
+              setJwkPublicKey(response.data.jwkPublicKey || null);
+              console.log('JWK Public Key:', response.data.jwkPublicKey);
+          } catch (error) {
+              console.error('Error fetching public key:', error);
+          }
+      };
+      fetchPublicKey();
+  }, []);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+    setFormData({ ...formData, [e.target.name]: e.target.value });
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      console.log('Public Key Base64:', publicKeyBase64);
+      // Backend public key (replace with your actual key)
+      if (!publicKeyBase64) {
+        throw new Error('Public key not loaded');
+      }
+
+      // Read the certificate with node-forge (limited ECDSA support)
+      //const cert = forge.pki.certificateFromPem(publicKeyCert);
+      //const publicKey = cert.publicKey;
+
+      // **Instead, you would need to export the public key (e.g., as PEM):**
+      //const publicKeyPem = forge.pki.publicKeyToPem(publicKey);
+
+      // Extract the public key in SPKI format
+     // const publicKeyInfo = certificate.subjectPublicKeyInfo;
+      //const spkiBuffer = publicKeyInfo.toSchema().toBER(); // Convert to BER encoded buffer 
+
+      
+      // Decode the Base64 public key
+      const decodedPublicKey = atob(publicKeyBase64);
+      console.log('Decoded Public Key:', decodedPublicKey);
+      const publicKeyBuffer = Uint8Array.from(decodedPublicKey, c => c.charCodeAt(0));
+      console.log('Public Key Buffer:', publicKeyBuffer);
+      if (publicKeyBuffer.length === 0) {
+        throw new Error('Public key buffer is empty');
+      }
+      
+
+      // Import the public key using Web Crypto API
+      const importedPublicKey = await crypto.subtle.importKey(
+        "jwk", // Or "spki" depending on your key format
+        JSON.parse(jwkPublicKey), // Use the JWK public key
+        {
+           name: "ECDH", // Algorithm name for P384
+           namedCurve: "P-384", // Specific curve for P384
+        },
+        true, // extractable
+        [] // Key usage 
+
+      );
+
+
+      //const info = new Uint8Array(); // Optional info parameter
+
+      // Serialize the form data
+      const serializedData = JSON.stringify(formData);
+      const data = new TextEncoder().encode(serializedData);
+
+      
+      // HPKE encryption
+
+
+      const suite = new CipherSuite({
+        kem: new DhkemP384HkdfSha384(),
+        kdf: new HkdfSha384(),
+        aead: new Aes256Gcm(),
+      });
+      
+      const senderKeyPair = await suite.kem.generateKeyPair(); 
+
+      console.log('UI Key Pair:', senderKeyPair);
+
+      // Create a sender context using the recipient's public key
+
+      const aad = new TextEncoder().encode("additional-data"); // Example aad
+      const info = new TextEncoder().encode("Info"); // Optional info parameter
+
+      // Create a sender context with the imported public key and the private key of the UI key pair
+      const sender = await suite.createSenderContext({
+        recipientPublicKey: importedPublicKey,
+        //senderKey: senderKeyPair, // Use the Sender KeyPair generated by the UI
+        info  : info.buffer, // Optional info parameter
+
+      });
+
+      const encapResult = sender.enc;
+
+      const ciphertext = await sender.seal(data.buffer,aad.buffer); // No additional authenticated data
+      
+      console.log('Encapsulated Key:', encapResult);
+      console.log('Ciphertext:', ciphertext);
+
+      
+      
+
+      // Base64 encode the ciphertext and encapsulated key for sending to the backend
+        const encodedCiphertext = btoa(String.fromCharCode.apply(null, Array.from(new Uint8Array(ciphertext))));
+        const encodedEncapsulatedKey = btoa(String.fromCharCode.apply(null, Array.from(new Uint8Array(encapResult))));
+        const aadValue = btoa(String.fromCharCode.apply(null,Array.from(aad))); // Base64 encode the AAD
+      console.log('Ciphertext:', encodedCiphertext);
+      console.log('Encapsulated Key:', encodedEncapsulatedKey); 
+      console.log('AAD:', aadValue);
+      // Send encrypted data to backend
+      const decryptionResponse = await axios.post('http://localhost:8080/hpke/decrypt', {
+         encapsulatedKey: encodedEncapsulatedKey, // Convert ArrayBuffer to Base64 string
+         ciphertext: encodedCiphertext,
+         aad: aadValue, // Include additional authenticated data if needed
+      });
+
+      console.log('Data submitted and encrypted successfully:', {
+        encapResult,
+        ciphertext,
+        aad
+      });
+      alert('Data submitted and encrypted successfully!');
+      console.log('Decryption Response:', decryptionResponse.data);
+    } catch (error) {
+      console.error('Error:', error);
+      alert('Failed to submit data.');
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <div>
+        <label htmlFor="name">Name:</label>
+        <input type="text" id="name" name="name" value={formData.name} onChange={handleChange} required />
+      </div>
+      <div>
+        <label htmlFor="email">Email:</label>
+        <input type="email" id="email" name="email" value={formData.email} onChange={handleChange} required />
+      </div>
+      <div>
+        <label htmlFor="message">Message:</label>
+        <textarea id="message" name="message" value={formData.message} onChange={handleChange} required />
+      </div>
+      <button type="submit">Submit</button>
+    </form>
+  );
+};
+export default MyForm;
